@@ -19,7 +19,7 @@ is made available in this module.
 
 import warnings
 
-# Python thrid-party imports.
+# Python third-party imports.
 import numpy as np
 
 # Local imports.
@@ -606,7 +606,7 @@ class PointSourceSolver(EikonalSolver):
                 )
             )
         idxs = np.nonzero(bool_idx)
-        # Sample the near-field taveltime field on the far-field nodes.
+        # Sample the near-field traveltime field on the far-field nodes.
         # Make sure to filter out any NaN values.
         tt = self.near_field.tt.resample(nodes[idxs].reshape(-1, 3))
         idxs = np.swapaxes(np.stack(idxs), 0, 1)[~np.isnan(tt)]
@@ -642,6 +642,7 @@ class PointSourceSolver(EikonalSolver):
         # the far-field grid.
         bool_idx = True
         for iax in range(3):
+            nodes[..., iax][np.abs(nodes[..., iax] - self.vv.min_coords[iax]) < 1e-14] = self.vv.min_coords[iax]
             bool_idx = bool_idx &(
                  (self.vv.iax_isnull[iax])
                 |(self.vv.iax_isperiodic[iax])
@@ -677,6 +678,8 @@ class PointSourceSolver(EikonalSolver):
         self.interpolate_near_field_traveltime_onto_far_field()
         # Initialize the narrow band of the far-field grid.
         self.initialize_far_field_narrow_band()
+        # Prevent finite values from being updated further.
+        self.known[np.isfinite(self.traveltime.values)] = True
         # Propagate the wavefront through the far field.
         super(PointSourceSolver, self).solve()
         return (True)
