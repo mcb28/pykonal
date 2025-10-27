@@ -17,6 +17,7 @@ cdef class EikonalSolver(object):
     cdef constants.UINT_t[3]       cy_is_periodic
 
     cpdef constants.BOOL_t solve(EikonalSolver self)
+    cpdef constants.BOOL_t solve_first_order(EikonalSolver self)
     cpdef np.ndarray[constants.REAL_t, ndim=2] trace_ray(
             EikonalSolver self,
             constants.REAL_t[:] end

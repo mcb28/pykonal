@@ -402,6 +402,169 @@ cdef class EikonalSolver(object):
                             trial.sift_down(0, heap_index[nbr[0], nbr[1], nbr[2]])
         return (True)
 
+    @cython.initializedcheck(False)
+    cpdef constants.BOOL_t solve_first_order(EikonalSolver self):
+        """
+        solve(self)
+
+        Solve the Eikonal equation using the FMM (no second-order finite differences).
+
+        :return: Returns True upon successful execution.
+        :rtype:  bool
+        """
+        cdef Py_ssize_t                           i, iax, idrxn, iheap
+        cdef Py_ssize_t[6][3]                     nbrs
+        cdef Py_ssize_t[3]                        nbr, switch, max_idx, active_idx
+        cdef Py_ssize_t[2]                        drxns = [-1, 1]
+        cdef Py_ssize_t[:,:,:]                    heap_index
+        cdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) idx
+        cdef int                                  count_a = 0
+        cdef int                                  count_b = 0
+        cdef int                                  inbr
+        cdef int[2]                               order
+        cdef constants.REAL_t                     a, b, c, bfd, ffd, new
+        cdef constants.REAL_t[2]                  fdu
+        cdef constants.REAL_t[3]                  aa, bb, cc
+        cdef constants.REAL_t[:,:,:]              tt, vv
+        cdef constants.REAL_t[:,:,:,:]            norm
+        cdef constants.BOOL_t[3]                  iax_isperiodic,
+        cdef constants.BOOL_t[:,:,:]              known, unknown
+        cdef heapq.Heap                           trial
+        
+        for iax in range(3):
+            max_idx[iax] = <Py_ssize_t> self.cy_traveltime.cy_npts[iax]
+            iax_isperiodic[iax] = <constants.BOOL_t> self.cy_traveltime.cy_iax_isperiodic[iax]
+
+        tt = self.traveltime.values
+        vv = self.velocity.values
+        norm = self.velocity.norm
+        known = self.known
+        unknown = self.unknown
+        trial = self.trial
+        heap_index = trial.cy_heap_index
+
+        while trial.cy_keys.size() > 0:
+            # Let Active be the point in Trial with the smallest
+            # traveltime value.
+            idx = trial.pop()
+            active_idx = [idx[0], idx[1], idx[2]]
+            known[active_idx[0], active_idx[1], active_idx[2]] = True
+
+            # Determine the indices of neighbouring nodes.
+            inbr = 0
+            for iax in range(3):
+                switch = [0, 0, 0]
+                for idrxn in range(2):
+                    switch[iax] = drxns[idrxn]
+                    for jax in range(3):
+                        if iax_isperiodic[jax]:
+                            nbrs[inbr][jax] = (
+                                  active_idx[jax]
+                                + switch[jax]
+                                + max_idx[jax]
+                            )\
+                            % max_idx[jax]
+                        else:
+                            nbrs[inbr][jax] = active_idx[jax] + switch[jax]
+                    inbr += 1
+
+            # Recompute the traveltime values at all Trial neighbours
+            # of Active by solving the piecewise quadratic equation.
+            for i in range(6):
+                nbr    = nbrs[i]
+                if not stencil(nbr[0], nbr[1], nbr[2], max_idx[0], max_idx[1], max_idx[2]) or known[nbr[0], nbr[1], nbr[2]]:
+                    continue
+                if vv[nbr[0], nbr[1], nbr[2]] > 0:
+                    for iax in range(3):
+                        switch = [0, 0, 0]
+                        idrxn = 0
+                        if norm[nbr[0], nbr[1], nbr[2], iax] == 0:
+                            aa[iax], bb[iax], cc[iax] = 0, 0, 0
+                            continue
+                        for idrxn in range(2):
+                            switch[iax] = drxns[idrxn]
+                            nbr1_i1 = (nbr[0]+switch[0]+max_idx[0]) % max_idx[0]\
+                                if iax_isperiodic[0] else nbr[0]+switch[0]
+                            nbr1_i2 = (nbr[1]+switch[1]+max_idx[1]) % max_idx[1]\
+                                if iax_isperiodic[1] else nbr[1]+switch[1]
+                            nbr1_i3 = (nbr[2]+switch[2]+max_idx[2]) % max_idx[2]\
+                                if iax_isperiodic[2] else nbr[2]+switch[2]
+                            nbr2_i1 = (nbr[0]+2*switch[0]+max_idx[0]) % max_idx[0]\
+                                if iax_isperiodic[0] else nbr[0]+2*switch[0]
+                            nbr2_i2 = (nbr[1]+2*switch[1]+max_idx[1]) % max_idx[1]\
+                                if iax_isperiodic[1] else nbr[1]+2*switch[1]
+                            nbr2_i3 = (nbr[2]+2*switch[2]+max_idx[2]) % max_idx[2]\
+                                if iax_isperiodic[2] else nbr[2]+2*switch[2]
+                            if (
+                                (
+                                    drxns[idrxn] == -1
+                                    and (nbr[iax] > 0 or iax_isperiodic[iax])
+                                )
+                                or (
+                                    drxns[idrxn] ==  1
+                                    and (nbr[iax] < max_idx[iax] - 1 or iax_isperiodic[iax])
+                                )
+                            )\
+                                and known[nbr1_i1, nbr1_i2, nbr1_i3]\
+                            :
+                                order[idrxn] = 1
+                                fdu[idrxn] = drxns[idrxn] * (
+                                    tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                                  - tt[nbr[0], nbr[1], nbr[2]]
+                                ) / norm[nbr[0], nbr[1], nbr[2], iax]
+                            else:
+                                order[idrxn], fdu[idrxn] = 0, 0
+                        if fdu[0] > -fdu[1]:
+                            # Do the update using the backward operator
+                            idrxn, switch[iax] = 0, -1
+                        else:
+                            # Do the update using the forward operator
+                            idrxn, switch[iax] = 1, 1
+                        nbr1_i1 = (nbr[0]+switch[0]+max_idx[0]) % max_idx[0]\
+                            if iax_isperiodic[0] else nbr[0]+switch[0]
+                        nbr1_i2 = (nbr[1]+switch[1]+max_idx[1]) % max_idx[1]\
+                            if iax_isperiodic[1] else nbr[1]+switch[1]
+                        nbr1_i3 = (nbr[2]+switch[2]+max_idx[2]) % max_idx[2]\
+                            if iax_isperiodic[2] else nbr[2]+switch[2]
+                        nbr2_i1 = (nbr[0]+2*switch[0]+max_idx[0]) % max_idx[0]\
+                            if iax_isperiodic[0] else nbr[0]+2*switch[0]
+                        nbr2_i2 = (nbr[1]+2*switch[1]+max_idx[1]) % max_idx[1]\
+                            if iax_isperiodic[1] else nbr[1]+2*switch[1]
+                        nbr2_i3 = (nbr[2]+2*switch[2]+max_idx[2]) % max_idx[2]\
+                            if iax_isperiodic[2] else nbr[2]+2*switch[2]
+                        if order[idrxn] == 1:
+                            aa[iax] = 1 / norm[nbr[0], nbr[1], nbr[2], iax]**2
+                            bb[iax] = -2 * tt[nbr1_i1, nbr1_i2, nbr1_i3]\
+                                / norm[nbr[0], nbr[1], nbr[2], iax] ** 2
+                            cc[iax] = tt[nbr1_i1, nbr1_i2, nbr1_i3]**2\
+                                / norm[nbr[0], nbr[1], nbr[2], iax]**2
+                        elif order[idrxn] == 0:
+                            aa[iax], bb[iax], cc[iax] = 0, 0, 0
+                    a = aa[0] + aa[1] + aa[2]
+                    if a == 0:
+                        count_a += 1
+                        continue
+                    b = bb[0] + bb[1] + bb[2]
+                    c = cc[0] + cc[1] + cc[2] - 1/vv[nbr[0], nbr[1], nbr[2]]**2
+                    if b**2 < 4*a*c:
+                        # This is a hack to solve the quadratic equation
+                        # when the discrimnant is negative. This hack
+                        # simply sets the discriminant to zero.
+                        new = -b / (2*a)
+                        count_b += 1
+                    else:
+                        new = (-b + sqrt(b**2 - 4*a*c)) / (2*a)
+                    if new < tt[nbr[0], nbr[1], nbr[2]]:
+                        tt[nbr[0], nbr[1], nbr[2]] = new
+                        # Tag as Trial all neighbours of Active that are not
+                        # Alive. If the neighbour is in Far, remove it from
+                        # that list and add it to Trial.
+                        if unknown[nbr[0], nbr[1], nbr[2]]:
+                            trial.push(nbr[0], nbr[1], nbr[2])
+                            unknown[nbr[0], nbr[1], nbr[2]] = False
+                        else:
+                            trial.sift_down(0, heap_index[nbr[0], nbr[1], nbr[2]])
+        return (True)
 
     cpdef np.ndarray[constants.REAL_t, ndim=2] trace_ray(
             EikonalSolver self,
